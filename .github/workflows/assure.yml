@@ -1,0 +1,87 @@
+name: Assure
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # id-token: write lets the Action sign in with this workflow's GitHub
+    # identity, so no Assure key is stored. contents: read stays beside it,
+    # or actions/checkout loses access.
+    permissions:
+      contents: read
+      id-token: write
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Install the PostgreSQL client
+        run: command -v psql || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+
+      - name: Load the schema
+        run: psql -v ON_ERROR_STOP=1 -f db/schema.sql
+
+      # A new role used for nothing else, with read access to settings and
+      # statistics only. The password is random for this run and masked.
+      - name: Create the Assure collection role
+        run: |
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::${password}"
+          echo "ASSURE_COLLECTOR_PASSWORD=${password}" >> "$GITHUB_ENV"
+          psql -v ON_ERROR_STOP=1 -v pw="${password}" <<'SQL'
+          CREATE ROLE assure_collector LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            PASSWORD :'pw';
+          GRANT pg_read_all_settings, pg_read_all_stats TO assure_collector;
+          GRANT CONNECT ON DATABASE postgres TO assure_collector;
+          SQL
+
+      # The server runs in a service container, so the runner cannot read its
+      # configuration files: no data-dir or config-dirs. Readings that need
+      # those files report "not observed"; the catalog readings still come back.
+      - name: Assure check
+        id: assure
+        uses: Symbolia-Assurance/assure-action@beta
+        with:
+          profile: postgresql-observed-baseline
+          connection: host=localhost port=5432 dbname=postgres user=assure_collector password=${{ env.ASSURE_COLLECTOR_PASSWORD }}
+          collection-role: assure_collector
+          collection-privileges: pg_read_all_settings,pg_read_all_stats
+          fail-on: fails
+          output: assure-verdict.json
+
+      - name: Keep the verdict
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: assure-verdict
+          path: ${{ steps.assure.outputs.verdict-path }}
